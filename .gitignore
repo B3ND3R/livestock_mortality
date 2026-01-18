@@ -1,3 +1,11 @@
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# image files
+.png
+.jpeg
+.gif
+.png
+.svg
+.ico

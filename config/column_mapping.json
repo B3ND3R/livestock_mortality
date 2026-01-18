@@ -1,0 +1,37 @@
+{
+    "losses": {
+        "s6q20a": "year",
+        "s6q20b": "month",
+        "s6q21": "livestock_type_raw",
+        "s6q22": "cause_raw",
+        "s6q23": "cause_detail",
+        "s6q24": "location",
+        "s6q25": "quantity"
+    },
+    "stock": {
+        "s6q1": "quantity_owned",
+        "s6q2": "quantity_born",
+        "s6q3": "quantity_bought_received",
+        "s6q4": "quantity_sold",
+        "s6q5": "quantity_died",
+        "s6q6": "quantity_slaughtered",
+        "s6q7": "quantity_given_out",
+        "s6q66": "quantity_lost_stolen",
+        "s6q67": "quantity_other_out",
+        "animaltype": "livestock_type"
+    },
+    "births": {
+        "s6q45a": "year_raw",
+        "s6q45b": "month_raw",
+        "s6q46": "livestock_type",
+        "s6q47": "quantity"
+    },
+    "offtake": {
+        "s6q36a": "year",
+        "s6q36b": "month",
+        "s6q37": "livestock_type",
+        "s6q38": "reason",
+        "s6q39": "quantity",
+        "s6q42": "price"
+    }
+}
