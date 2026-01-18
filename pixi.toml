@@ -1,0 +1,9 @@
+[workspace]
+channels = ["conda-forge"]
+name = "livestock_mortality"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
