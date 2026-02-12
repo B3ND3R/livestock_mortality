@@ -9,3 +9,6 @@
 .png
 .svg
 .ico
+
+# data uploaded from GDrive
+data/*
