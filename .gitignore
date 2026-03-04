@@ -12,3 +12,7 @@
 
 # data uploaded from GDrive
 data/*
+
+# notebook checkpoints
+.ipynb_checkpoints/*
+*/.ipynb_checkpoints/*
