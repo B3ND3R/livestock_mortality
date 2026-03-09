@@ -1,26 +1,32 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import boto3
 import json
 
 # ------------------------------------------------------------------
 # Paths
 # ------------------------------------------------------------------
-DATA_DIR_IBLI = Path("../data/IBLIData_CSV_PublicZipped")
+
+DATA_DIR_IBLI = "s3://amazon-sagemaker-575108933641-us-east-1-c422b90ce861/dzd-ayr06tncl712p3/5t7l23o0xvt99j/dev/local-uploads/1771807288486/IBLIData_CSV_PublicZipped"
+EXPORT_DIR = "s3://amazon-sagemaker-575108933641-us-east-1-c422b90ce861/dzd-ayr06tncl712p3/5t7l23o0xvt99j/dev/data/training/ibli"
 
 # Load column mapping
-with open("../config/column_mapping.json", "r") as f:
-    col_map = json.load(f)
+s3 = boto3.client("s3")
+bucket = "lmr-capstone-s3bucket"
+key = "data/training/ibli/column_mapping.json"
+response = s3.get_object(Bucket=bucket, Key=key)
+col_map = json.loads(response["Body"].read())
 
 # ------------------------------------------------------------------
 # Load required datasets
 # ------------------------------------------------------------------
-losses = pd.read_csv(DATA_DIR_IBLI / "S6C Livestock Losses.csv") \
+losses = pd.read_csv(f"{DATA_DIR_IBLI}/S6C Livestock Losses.csv") \
            .rename(columns=col_map["losses"])
 
-locations = pd.read_csv(DATA_DIR_IBLI / "HH_location_shifted.csv")
+locations = pd.read_csv(f"{DATA_DIR_IBLI}/HH_location_shifted.csv")
 
-stock_df_init = pd.read_csv('../data/IBLIData_CSV_PublicZipped/S6A Livestock Stock.csv')\
+stock_df_init = pd.read_csv(f"{DATA_DIR_IBLI}/S6A Livestock Stock.csv")\
     .rename(columns={'s6q1':'total_animals_herded',
                      's6q2':'herded_animals_owned',
                      's6q3':'herded_animals_adult',
@@ -101,7 +107,7 @@ valid_spatial = valid_spatial.loc[~((valid_spatial.year=='.a')|
 # ------------------------------------------------------------------
 # Export spatial dataset -- prepared using Matt's logic
 # ------------------------------------------------------------------
-path = DATA_DIR_IBLI / "livestock_losses_spatial_pipeline.csv"
+path = f"{EXPORT_DIR}/livestock_losses_spatial_pipeline.csv"
 valid_spatial.to_csv(path, index=False)
 print(f'Exported spatial dataset: {path}')
 
@@ -296,7 +302,7 @@ result['tlu_loss_ratio'] = np.where((result['tlu_loss']==0) & result['tlu_loss_r
                                     0,
                                     result['tlu_loss_ratio'])
 
-result.to_csv('../data/target_data_pipeline.csv', index=False)
+result.to_csv(f"{EXPORT_DIR}/target_data_pipeline.csv", index=False)
 
 print('\n',"="*25, "Created target dataset","="*25)
 print(f"Total rows: {len(result)}")
