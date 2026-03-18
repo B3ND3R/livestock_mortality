@@ -23,3 +23,4 @@ cd pipeline
 pixi run prepare_targets.py
 ```
 Creates `data/target_data_pipeline.csv`
+

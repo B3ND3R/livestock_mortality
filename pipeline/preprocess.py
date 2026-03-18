@@ -34,9 +34,11 @@ def run_preprocess(
             # --- Load ---
             try:
                 df = pd.read_parquet(raw_data_s3_path)
-                df = df[['tlu_loss'] + feature_names]
-            except ValueError:
-                print(f"Raw data must be parquet file. Invalid file type: {raw_data_s3_path}")
+                df = df[[label_column] + feature_names]
+            except ValueError as e:
+                raise ValueError(
+                    f"Raw data must be a parquet file. Invalid file: {raw_data_s3_path}"
+                ) from e
 
             # --- Validate ---
             if label_column not in df.columns:
@@ -51,14 +53,17 @@ def run_preprocess(
             df = df.reset_index(drop=True)
 
             # --- Log dataset stats to MLflow ---
-            mlflow.log_params({
+            param_dict = {
                 "raw_row_count": initial_shape[0],
                 "raw_col_count": initial_shape[1],
                 "missing_values_before_imputation": int(missing_before),
                 "cleaned_row_count": df.shape[0],
                 "label_column": label_column,
                 "test_size": test_size,
-            })
+            }
+            
+            print(f"parameters: {param_dict}")
+            mlflow.log_params(param_dict)
 
             mlflow.log_metrics({
                 "label_mean": float(df[label_column].mean()),
