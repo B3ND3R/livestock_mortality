@@ -28,6 +28,15 @@ S3_BUCKET = (
     "/dzd-ayr06tncl712p3/5t7l23o0xvt99j/dev"
 )
 
+def _ensure_str_list(*items):
+    """Flatten any nested lists and ensure all elements are strings."""
+    result = []
+    for item in items:
+        if isinstance(item, list):
+            result.extend(item)
+        else:
+            result.append(item)
+    return result
 
 def run_preprocess(
     raw_data_s3_path: str,
@@ -56,6 +65,10 @@ def run_preprocess(
     import pandas as pd
     import numpy as np
 
+    # Flatten feature_names in case it arrives wrapped in an extra list
+    if feature_names and isinstance(feature_names[0], list):
+        feature_names = feature_names[0]
+
     if feature_names is None:
         feature_names = [
             'soil', 'ppt', 'pdsi', 'vpd', 'ndvi', 'lai', 'lst',
@@ -66,9 +79,9 @@ def run_preprocess(
             'ndvi_lag1', 'ndvi_lag2', 'ndvi_lag3',
             'lai_lag1',  'lai_lag2',  'lai_lag3',
             'lst_lag1',  'lst_lag2',  'lst_lag3',
-            'month_sin', 'month_cos', 'hhid_tlu_enc',
+            'month_sin', 'month_cos',
         ]
-
+    
     mlflow.set_tracking_uri(TRACKING_SERVER_ARN)
     mlflow.set_experiment(experiment_name)
 
@@ -85,7 +98,12 @@ def run_preprocess(
                     f"Could not read parquet file: {raw_data_s3_path}"
                 ) from e
 
-            required_cols = [date_column, label_column] + feature_names
+            if isinstance(date_column, list):
+                date_column = date_column[0]
+            if isinstance(label_column, list):
+                label_column = label_column[0]
+            
+            required_cols = _ensure_str_list(date_column, label_column, *feature_names)
             missing_cols = [c for c in required_cols if c not in df.columns]
             if missing_cols:
                 raise ValueError(
