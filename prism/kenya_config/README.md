@@ -79,7 +79,7 @@ frontend/src/config/kenya/
 ├── prism.json
 ├── layers.json
 ├── index.ts
-└── admin_boundaries.json  (Marsabit county boundary GeoJSON)
+└── admin_boundaries.json  (Admin level 3 boundaries GeoJSON)
 ```
 
 ## Step 4: Get Admin Boundaries
