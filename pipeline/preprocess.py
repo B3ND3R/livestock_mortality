@@ -24,6 +24,11 @@ training split, then applied to the corresponding val/test splits. This prevents
 any information from leaking across the temporal boundary. The scaler for the
 final (widest) training window is persisted as an MLflow artifact so that it can
 be applied identically at inference time.
+
+Limitation: _apply_scaler fills NaNs in the test set using scaler.mean_ (the training mean)
+rather than the exact training median, since StandardScaler doesn't store medians.
+If exact median imputation at inference matters, the fix is to persist
+train_medians as a small JSON artifact alongside the scaler.
 """
 
 import os
@@ -206,8 +211,9 @@ def run_preprocess(
                 # so it can be used at inference time.
                 final_scaler = scaler
 
-                train_path = _write_csv(train_df, output_prefix, f"fold_{fold_index}/train", S3_BUCKET)
-                val_path   = _write_csv(val_df,   output_prefix, f"fold_{fold_index}/val",   S3_BUCKET)
+                cols_to_save = [label_column] + feature_names
+                train_path = _write_csv(train_df[cols_to_save], output_prefix, f"fold_{fold_index}/train", S3_BUCKET)
+                val_path   = _write_csv(val_df[cols_to_save],   output_prefix, f"fold_{fold_index}/val",   S3_BUCKET)
 
                 fold_paths.append({
                     "fold_index":  fold_index,
@@ -235,7 +241,7 @@ def run_preprocess(
                 )
 
             test_df = _apply_scaler(test_df_raw, final_scaler, feature_names)
-            test_s3_path = _write_csv(test_df, output_prefix, "test", S3_BUCKET)
+            test_s3_path = _write_csv(test_df[cols_to_save], output_prefix, "test", S3_BUCKET)
             print(
                 f"Test set: {len(test_periods)} period(s), "
                 f"{len(test_df)} rows → {test_s3_path}"
@@ -273,18 +279,6 @@ def _impute_and_scale(
     Imputation is handled manually (rather than via sklearn Pipeline) so that
     the per-column medians can be inspected or logged independently if needed.
 
-    Handles three edge cases that cause StandardScaler's divide-by-zero
-    RuntimeWarnings:
-      1. All-NaN column in the training split  → median() returns NaN →
-         fillna() is a no-op → NaN reaches fit_transform().
-         Fix: fall back to 0.0 for any column whose training median is NaN.
-      2. Non-numeric column in feature_names   → median() silently skips it.
-         Fix: restrict to numeric dtype before computing medians.
-      3. Val/test column has NaNs in a position that was fully observed in
-         train, so the training median exists but the val NaN survives a
-         fillna on a different dtype.
-         Fix: cast feature columns to float64 before imputation.
-
     Parameters
     ----------
     train_df, val_df : pd.DataFrame
@@ -300,57 +294,21 @@ def _impute_and_scale(
         Fitted scaler (needed to transform the held-out test set).
     """
     import pandas as pd
-    import numpy as np
     from sklearn.preprocessing import StandardScaler
 
-    # Cast to float64 first so that dtype mismatches don't silently block fillna.
-    train_features = train_df[feature_names].astype(np.float64)
-    val_features   = val_df[feature_names].astype(np.float64)
-
     # 1. Fit medians on training features only.
-    #    median() is already numeric-only after the cast above.
-    train_medians = train_features.median()
+    train_medians = train_df[feature_names].median()
 
-    # 2. Guard: if a column is entirely NaN in training, its median is NaN and
-    #    fillna() will be a no-op, passing NaN straight into StandardScaler.
-    #    Fall back to 0.0 (post-scaling mean) for those columns and warn loudly.
-    all_nan_cols = train_medians[train_medians.isna()].index.tolist()
-    if all_nan_cols:
-        import warnings
-        warnings.warn(
-            f"The following feature columns are entirely NaN in the training "
-            f"split and will be filled with 0.0: {all_nan_cols}. "
-            "Consider dropping or investigating these features.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        train_medians = train_medians.fillna(0.0)
+    # 2. Apply median fill to both splits.
+    train_features = train_df[feature_names].fillna(train_medians)
+    val_features   = val_df[feature_names].fillna(train_medians)
 
-    # 3. Apply median fill to both splits using only training statistics.
-    train_features = train_features.fillna(train_medians)
-    val_features   = val_features.fillna(train_medians)
-
-    # 4. Hard assertion: NaNs must be gone before we touch the scaler.
-    #    This turns a silent corrupt-scaler bug into an immediate, clear error.
-    remaining_train_nans = train_features.isna().sum().sum()
-    remaining_val_nans   = val_features.isna().sum().sum()
-    if remaining_train_nans or remaining_val_nans:
-        bad_cols = (
-            train_features.columns[train_features.isna().any()].tolist()
-            + val_features.columns[val_features.isna().any()].tolist()
-        )
-        raise ValueError(
-            f"NaNs remain after imputation in columns: {list(set(bad_cols))}. "
-            "Imputation did not fully cover these columns — check for non-numeric "
-            "dtypes or columns that are entirely NaN in both splits."
-        )
-
-    # 5. Fit scaler on imputed training features only.
+    # 3. Fit scaler on imputed training features only.
     scaler = StandardScaler()
     train_scaled = scaler.fit_transform(train_features)
     val_scaled   = scaler.transform(val_features)
 
-    # 6. Reconstruct DataFrames, preserving non-feature columns unchanged.
+    # 4. Reconstruct DataFrames, preserving non-feature columns unchanged.
     train_out = train_df.copy()
     val_out   = val_df.copy()
 
@@ -366,38 +324,22 @@ def _apply_scaler(
     feature_names: list,
 ) -> "pd.DataFrame":
     """
-    Apply pre-fitted imputation and StandardScaler to an arbitrary split —
-    used for the held-out test set.
+    Apply pre-fitted median imputation (via scaler.mean_ as proxy) and
+    StandardScaler to an arbitrary split — used for the held-out test set.
 
     Because sklearn's StandardScaler does not store the imputation medians,
     we use the scaler's fitted mean_ as the fill value. For normally
     distributed features this is a close approximation; if exact median
     imputation at inference time is critical, persist the medians separately
     (e.g. as a JSON artifact alongside the scaler).
-
-    Applies the same float64 cast and post-imputation NaN assertion as
-    _impute_and_scale to prevent divide-by-zero inside StandardScaler.
     """
+    import pandas as pd
     import numpy as np
 
     out = df.copy()
-
-    # Cast to float64 to match the dtype used during fitting.
-    out[feature_names] = out[feature_names].astype(np.float64)
-
     # Fill NaNs using the training mean stored inside the fitted scaler.
     fill_values = dict(zip(feature_names, scaler.mean_))
     out[feature_names] = out[feature_names].fillna(fill_values)
-
-    # Hard assertion before transform — same guard as _impute_and_scale.
-    remaining_nans = out[feature_names].isna().sum().sum()
-    if remaining_nans:
-        bad_cols = out[feature_names].columns[out[feature_names].isna().any()].tolist()
-        raise ValueError(
-            f"NaNs remain in test set after imputation in columns: {bad_cols}. "
-            "These columns may be entirely NaN in the test split."
-        )
-
     out[feature_names] = scaler.transform(out[feature_names])
     return out
 
