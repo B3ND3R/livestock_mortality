@@ -14,14 +14,14 @@ Fixes implemented
    - Previously, test used scaler.mean_ as a proxy, which changes missing-value
      behavior and can distort downstream predictions.
 
-2) step_months implemented properly:
-   - Validation windows are length = step_months periods (not just one period).
+2) step_years implemented properly:
+   - Validation windows are length = step_years years (not just one period).
 
 3) Fold indexing logic simplified and corrected:
    - Fold i uses:
-       train = periods [0 : min_train_months + i*step_months]
-       val   = next step_months periods
-   - Last step_months periods are held out as the final test set.
+       train = years [0 : min_train_years + i*step_years]
+       val   = next step_years years
+   - Last step_years years are held out as the final test set.
 
 Artifacts logged to MLflow
 --------------------------
@@ -53,8 +53,8 @@ def run_preprocess(
     output_s3_base_uri: str,
     label_column: str = "tlu_loss_ratio",
     date_column: str = "month",
-    min_train_months: int = 12,
-    step_months: int = 1,
+    min_train_years: int = 1,
+    step_years: int = 1,
     feature_names: Optional[List[str]] = None,
 ) -> Tuple[List[Dict], str, str, str]:
     """
@@ -76,15 +76,15 @@ def run_preprocess(
         Target column.
     date_column : str
         Time ordering column (Period, datetime, int, etc).
-    min_train_months : int
-        Minimum number of periods in the initial training window.
-    step_months : int
-        Number of periods per validation window, and expansion step.
+    min_train_years : int
+        Minimum number of years in the initial training window.
+    step_years : int
+        Number of years per validation window, and expansion step.
 
     Returns
     -------
     fold_paths : list[dict]
-        Each dict has keys: fold_index, train, val, train_rows, val_rows, val_periods.
+        Each dict has keys: fold_index, train, val, train_rows, val_rows, val_years.
     test_s3_path : str
         S3 path to held-out final test set CSV.
     experiment_name : str
@@ -114,10 +114,10 @@ def run_preprocess(
             "month_sin", "month_cos", "hhid_tlu_enc",
         ]
 
-    if step_months < 1:
-        raise ValueError("step_months must be >= 1")
-    if min_train_months < 1:
-        raise ValueError("min_train_months must be >= 1")
+    if step_years < 1:
+        raise ValueError("step_years must be >= 1")
+    if min_train_years < 1:
+        raise ValueError("min_train_years must be >= 1")
 
     mlflow.set_tracking_uri(TRACKING_SERVER_ARN)
     mlflow.set_experiment(experiment_name)
@@ -152,18 +152,22 @@ def run_preprocess(
             # Sort by time (critical).
             df = df.sort_values(date_column).reset_index(drop=True)
 
-            # Unique periods in sorted order
-            sorted_periods = df[date_column].dropna().unique()
-            n_periods = len(sorted_periods)
+            # Extract year from each period and get unique sorted years
+            _dates = df[date_column]
+            if hasattr(_dates.dtype, "freq"):  # PeriodDtype
+                _dates = _dates.dt.to_timestamp()
+            df["_year"] = pd.to_datetime(_dates).dt.year
+            sorted_years = sorted(df["_year"].dropna().unique())
+            n_years = len(sorted_years)
 
-            # We hold out the final step_months as test set.
-            # Need enough periods for: initial train + at least one val window + test window
-            min_required = min_train_months + step_months + step_months
-            if n_periods < min_required:
+            # We hold out the final step_years as test set.
+            # Need enough years for: initial train + at least one val window + test window
+            min_required = min_train_years + step_years + step_years
+            if n_years < min_required:
                 raise ValueError(
-                    f"Dataset has only {n_periods} unique periods in '{date_column}', "
+                    f"Dataset has only {n_years} unique years in '{date_column}', "
                     f"but needs at least {min_required} for "
-                    f"min_train_months={min_train_months}, step_months={step_months} "
+                    f"min_train_years={min_train_years}, step_years={step_years} "
                     f"(train + val + test)."
                 )
 
@@ -174,9 +178,9 @@ def run_preprocess(
                 "cleaned_row_count": df.shape[0],
                 "label_column": label_column,
                 "date_column": date_column,
-                "n_unique_periods": int(n_periods),
-                "min_train_months": int(min_train_months),
-                "step_months": int(step_months),
+                "n_unique_years": int(n_years),
+                "min_train_years": int(min_train_years),
+                "step_years": int(step_years),
                 "raw_data_s3_path": raw_data_s3_path,
                 "output_prefix": output_prefix,
                 "output_s3_base_uri": output_s3_base_uri,
@@ -192,13 +196,13 @@ def run_preprocess(
                 context="DataPreprocessing",
             )
 
-            # ---- Split periods into CV pool and test pool ----
-            test_periods = list(sorted_periods[-step_months:])
-            cv_periods = list(sorted_periods[:-step_months])
+            # ---- Split years into CV pool and test pool ----
+            test_years = sorted_years[-step_years:]
+            cv_years = sorted_years[:-step_years]
 
-            test_df_raw = df[df[date_column].isin(test_periods)].reset_index(drop=True)
+            test_df_raw = df[df["_year"].isin(test_years)].reset_index(drop=True)
 
-            # ---- Build expanding-window folds ----
+            # ---- Build expanding-window folds (year-based) ----
             fold_paths: List[Dict] = []
             cols_to_save = [label_column] + list(feature_names)
 
@@ -207,19 +211,19 @@ def run_preprocess(
             final_train_medians = None
 
             fold_index = 0
-            train_end = min_train_months  # number of periods in train window
+            train_end = min_train_years  # number of years in train window
 
             while True:
                 val_start = train_end
-                val_end = train_end + step_months
-                if val_end > len(cv_periods):
+                val_end = train_end + step_years
+                if val_end > len(cv_years):
                     break  # no more full validation windows
 
-                train_periods = cv_periods[:train_end]
-                val_periods = cv_periods[val_start:val_end]
+                train_years = cv_years[:train_end]
+                val_years = cv_years[val_start:val_end]
 
-                train_df_raw_fold = df[df[date_column].isin(train_periods)].reset_index(drop=True)
-                val_df_raw_fold = df[df[date_column].isin(val_periods)].reset_index(drop=True)
+                train_df_raw_fold = df[df["_year"].isin(train_years)].reset_index(drop=True)
+                val_df_raw_fold = df[df["_year"].isin(val_years)].reset_index(drop=True)
 
                 train_df, val_df, scaler, train_medians = _impute_and_scale(
                     train_df_raw=train_df_raw_fold,
@@ -246,9 +250,9 @@ def run_preprocess(
 
                 fold_paths.append({
                     "fold_index": fold_index,
-                    "train_periods_n": len(train_periods),
-                    "val_periods_n": len(val_periods),
-                    "val_periods": [str(p) for p in val_periods],
+                    "train_years_n": len(train_years),
+                    "val_years_n": len(val_years),
+                    "val_years": [int(y) for y in val_years],
                     "train_rows": int(len(train_df)),
                     "val_rows": int(len(val_df)),
                     "train": train_path,
@@ -256,17 +260,17 @@ def run_preprocess(
                 })
 
                 print(
-                    f"Fold {fold_index}: train_periods={len(train_periods)} "
-                    f"val_periods={len(val_periods)} "
+                    f"Fold {fold_index}: train_years={len(train_years)} "
+                    f"val_years={len(val_years)} "
                     f"train_rows={len(train_df)} val_rows={len(val_df)}"
                 )
 
                 fold_index += 1
-                train_end += step_months  # expanding window
+                train_end += step_years  # expanding window
 
             if not fold_paths or final_scaler is None or final_train_medians is None:
                 raise RuntimeError(
-                    "No CV folds were produced. Check min_train_months/step_months vs. dataset size."
+                    "No CV folds were produced. Check min_train_years/step_years vs. dataset size."
                 )
 
             # ---- Transform test set using final fold's medians + scaler ----
@@ -282,7 +286,7 @@ def run_preprocess(
                 prefix=output_prefix,
                 name="test",
             )
-            print(f"Test set: periods={list(map(str, test_periods))} rows={len(test_df)} → {test_s3_path}")
+            print(f"Test set: years={test_years} rows={len(test_df)} → {test_s3_path}")
 
             # ---- Persist scaler + medians as MLflow artifacts ----
             with tempfile.TemporaryDirectory() as tmp_dir:
@@ -301,7 +305,7 @@ def run_preprocess(
 
             mlflow.log_params({
                 "n_cv_folds": int(len(fold_paths)),
-                "test_periods": str([str(p) for p in test_periods]),
+                "test_years": str([int(y) for y in test_years]),
                 "test_rows": int(len(test_df)),
             })
 
