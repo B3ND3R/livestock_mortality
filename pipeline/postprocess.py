@@ -66,14 +66,27 @@ def load_admin3_boundaries(shapefile_path: str) -> "gpd.GeoDataFrame":
 
     gdf = gpd.read_file(shapefile_path)
 
-    # Standardize column names (IEBC shapefile uses ADM3_EN, ADM3_PCODE, etc.)
+    # Standardize column names to ADM3_EN, ADM3_PCODE, ADM2_EN, ADM1_EN
     required = ["ADM3_EN", "ADM3_PCODE", "ADM2_EN", "ADM1_EN", "geometry"]
     missing = [c for c in required if c not in gdf.columns]
     if missing:
+        # Try case-insensitive match first
         col_map = {c.upper(): c for c in gdf.columns}
-        for req in missing:
+        for req in missing[:]:
             if req.upper() in col_map:
                 gdf = gdf.rename(columns={col_map[req.upper()]: req})
+
+        # Fallback: explicit mapping for Kenya IEBC wards shapefile column names
+        iebc_col_map = {
+            "ADM3_EN": "IEBC_WARDS",
+            "ADM3_PCODE": "PCODE",
+            "ADM2_EN": "FIRST_DIST",
+            "ADM1_EN": "FIRST_PROV",
+        }
+        still_missing = [c for c in required if c not in gdf.columns]
+        rename = {iebc_col_map[req]: req for req in still_missing if iebc_col_map.get(req) in gdf.columns}
+        if rename:
+            gdf = gdf.rename(columns=rename)
 
     still_missing = [c for c in required if c not in gdf.columns]
     if still_missing:
@@ -82,7 +95,10 @@ def load_admin3_boundaries(shapefile_path: str) -> "gpd.GeoDataFrame":
             f"Available columns: {gdf.columns.tolist()}"
         )
 
-    gdf = gdf.to_crs(epsg=4326)  # ensure WGS84
+    if gdf.crs is None:
+        gdf = gdf.set_crs(epsg=4326)  # assume WGS84 if no CRS is defined
+    else:
+        gdf = gdf.to_crs(epsg=4326)  # reproject to WGS84
     return gdf[required]
 
 
