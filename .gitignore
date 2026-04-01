@@ -20,3 +20,7 @@ data/*
 # pycache
 __pycache__/*
 */__pycache__/*
+
+# scratch files in development
+TODO
+scratch.ipynb

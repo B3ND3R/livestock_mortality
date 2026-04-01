@@ -19,6 +19,13 @@ Artifacts logged to MLflow
 --------------------------
 - postprocessing/ward_predictions.csv
 - postprocessing/ward_predictions.geojson
+- postprocessing/ward_predictions.tif  (3-band GeoTIFF)
+
+GeoTIFF bands
+-------------
+  Band 1 : risk_level_encoded   int16   0=Normal 1=Concerning 2=Critical  nodata=-1
+  Band 2 : confidence           float32 0–1                               nodata=-9999
+  Band 3 : top_feature_importance float32 mean |SHAP| of #1 feature/ward  nodata=-9999
 """
 
 from __future__ import annotations
@@ -164,6 +171,116 @@ def compute_shap_values(
     return pd.DataFrame(shap_values, columns=feature_names, index=X.index)
 
 
+def rasterize_ward_predictions(
+    ward_geo: "gpd.GeoDataFrame",
+    output_path: str,
+    resolution: float = 0.01,
+    risk_encoding: Optional[Dict[str, int]] = None,
+) -> None:
+    """
+    Rasterize ward-level predictions to a 3-band GeoTIFF (EPSG:4326).
+
+    Parameters
+    ----------
+    ward_geo : gpd.GeoDataFrame
+        Ward GeoDataFrame with columns: risk_level, confidence, top_features.
+    output_path : str
+        Local file path for the output GeoTIFF.
+    resolution : float
+        Pixel size in degrees (default 0.01 ≈ 1.1 km at equator).
+    risk_encoding : dict, optional
+        Mapping from risk-level name to integer code.
+        Defaults to Normal=0, Concerning=1, Critical=2.
+
+    Bands
+    -----
+    1 : risk_level_encoded   (float32, nodata=-9999)
+    2 : confidence           (float32, nodata=-9999)
+    3 : top_feature_importance (float32, nodata=-9999) — mean |SHAP| of #1 feature
+    """
+    import rasterio
+    from rasterio.features import rasterize as rio_rasterize
+    from rasterio.transform import from_bounds
+
+    if risk_encoding is None:
+        risk_encoding = {"Normal": 0, "Concerning": 1, "Critical": 2}
+
+    nodata = -9999.0
+
+    minx, miny, maxx, maxy = ward_geo.total_bounds
+    width = max(1, int(np.ceil((maxx - minx) / resolution)))
+    height = max(1, int(np.ceil((maxy - miny) / resolution)))
+    transform = from_bounds(minx, miny, maxx, maxy, width, height)
+
+    def _shapes(values):
+        """Yield (geometry, float_value) pairs, skipping NaN."""
+        for geom, val in zip(ward_geo.geometry, values):
+            if pd.isna(val):
+                continue
+            yield geom, float(val)
+
+    # Band 1: risk level encoded as 0 / 1 / 2
+    risk_encoded = ward_geo["risk_level"].map(risk_encoding)
+    band1 = rio_rasterize(
+        _shapes(risk_encoded),
+        out_shape=(height, width),
+        transform=transform,
+        fill=nodata,
+        dtype="float32",
+    )
+
+    # Band 2: confidence
+    band2 = rio_rasterize(
+        _shapes(ward_geo["confidence"]),
+        out_shape=(height, width),
+        transform=transform,
+        fill=nodata,
+        dtype="float32",
+    )
+
+    # Band 3: importance of the top SHAP feature per ward
+    top_importances = []
+    for val in ward_geo["top_features"]:
+        try:
+            features = json.loads(val) if isinstance(val, str) else val
+            top_importances.append(features[0]["importance"] if features else np.nan)
+        except Exception:
+            top_importances.append(np.nan)
+
+    band3 = rio_rasterize(
+        _shapes(pd.Series(top_importances, index=ward_geo.index)),
+        out_shape=(height, width),
+        transform=transform,
+        fill=nodata,
+        dtype="float32",
+    )
+
+    band_tags = [
+        {"name": "risk_level_encoded", "encoding": json.dumps(risk_encoding)},
+        {"name": "confidence"},
+        {"name": "top_feature_importance"},
+    ]
+
+    with rasterio.open(
+        output_path,
+        "w",
+        driver="GTiff",
+        height=height,
+        width=width,
+        count=3,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=transform,
+        nodata=nodata,
+        compress="lzw",
+    ) as dst:
+        for band_idx, (band_data, tags) in enumerate(
+            zip([band1, band2, band3], band_tags), start=1
+        ):
+            dst.write(band_data, band_idx)
+            dst.update_tags(band_idx, **tags)
+
+
 def aggregate_top_features(
     shap_df: pd.DataFrame,
     top_n: int = 5,
@@ -191,7 +308,8 @@ def run_postprocess(
     feature_names: Optional[List[str]] = None,
     top_n_features: int = 5,
     risk_thresholds: Optional[Dict[str, Tuple[float, float]]] = None,
-) -> Tuple[str, str]:
+    geotiff_resolution: float = 0.01,
+) -> Tuple[str, str, str]:
     """
     Postprocess model predictions by aggregating to ADMIN3 ward level.
 
@@ -226,10 +344,17 @@ def run_postprocess(
 
     Returns
     -------
+    geotiff_resolution : float
+        GeoTIFF pixel size in degrees (default 0.01 ≈ 1.1 km at equator).
+
+    Returns
+    -------
     ward_csv_s3_path : str
         S3 path to ward-level predictions CSV.
     ward_geojson_s3_path : str
         S3 path to ward-level predictions GeoJSON.
+    ward_geotiff_s3_path : str
+        S3 path to 3-band GeoTIFF (risk_level / confidence / top_feature_importance).
     """
     import geopandas as gpd
     import mlflow
@@ -400,9 +525,18 @@ def run_postprocess(
                 ward_geo.to_file(geojson_path, driver="GeoJSON")
                 mlflow.log_artifact(geojson_path, artifact_path="postprocessing")
 
+                geotiff_path = os.path.join(tmp_dir, "ward_predictions.tif")
+                rasterize_ward_predictions(
+                    ward_geo,
+                    output_path=geotiff_path,
+                    resolution=geotiff_resolution,
+                )
+                mlflow.log_artifact(geotiff_path, artifact_path="postprocessing")
+
                 print("Logged MLflow artifacts:")
                 print(" - postprocessing/ward_predictions.csv")
                 print(" - postprocessing/ward_predictions.geojson")
+                print(" - postprocessing/ward_predictions.tif")
 
             # ── 7. Write outputs to S3 ───────────────────────────────────
             import s3fs
@@ -410,17 +544,28 @@ def run_postprocess(
             base_dir = predictions_s3_path.rsplit("/", 1)[0]
             csv_s3 = f"{base_dir}/ward_predictions.csv"
             geojson_s3 = f"{base_dir}/ward_predictions.geojson"
+            geotiff_s3 = f"{base_dir}/ward_predictions.tif"
 
             ward_df.to_csv(csv_s3, index=False)
 
-            # geopandas/fiona may not support S3 URIs directly;
-            # write to temp file then upload via s3fs
+            # geopandas/fiona and rasterio may not support S3 URIs directly;
+            # write to temp files then upload via s3fs
+            fs = s3fs.S3FileSystem()
+
             with tempfile.NamedTemporaryFile(suffix=".geojson", delete=True) as tmp:
                 ward_geo.to_file(tmp.name, driver="GeoJSON")
-                fs = s3fs.S3FileSystem()
                 fs.put(tmp.name, geojson_s3)
 
-            print(f"Ward CSV: {csv_s3}")
-            print(f"Ward GeoJSON: {geojson_s3}")
+            with tempfile.NamedTemporaryFile(suffix=".tif", delete=True) as tmp:
+                rasterize_ward_predictions(
+                    ward_geo,
+                    output_path=tmp.name,
+                    resolution=geotiff_resolution,
+                )
+                fs.put(tmp.name, geotiff_s3)
 
-            return csv_s3, geojson_s3
+            print(f"Ward CSV:     {csv_s3}")
+            print(f"Ward GeoJSON: {geojson_s3}")
+            print(f"Ward GeoTIFF: {geotiff_s3}")
+
+            return csv_s3, geojson_s3, geotiff_s3
