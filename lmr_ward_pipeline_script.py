@@ -80,6 +80,7 @@ matplotlib.use("Agg")
 from scipy import stats
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     r2_score, mean_squared_error, mean_absolute_error,
     roc_auc_score, f1_score, precision_score, recall_score,
@@ -785,17 +786,28 @@ print("Metrics helpers defined")
 # TRAINING HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 def fit_model(model_name, X_train, y_train, X_val, y_val,
-              sample_weight=None, params=None):
+              sample_weight=None, params=None,
+              X_train_scaled=None, X_val_scaled=None):
+    """
+    Fit a single model. Ridge uses StandardScaler-scaled inputs (X_train_scaled,
+    X_val_scaled) if provided — all other models use raw median-imputed inputs.
+    Scaling is applied externally so the scaler can be saved for inference.
+    """
     model = build_model(model_name, params)
     cfg   = MODEL_REGISTRY[model_name]
     sw    = sample_weight if cfg["supports_sample_weight"] else None
+
+    # Ridge uses scaled features for defensible L2 regularisation
+    Xt = X_train_scaled if (model_name == "ridge" and X_train_scaled is not None) else X_train
+    Xv = X_val_scaled   if (model_name == "ridge" and X_val_scaled   is not None) else X_val
+
     if cfg["supports_early_stopping"] and model_name in ("xgboost","lgbm"):
-        fit_kwargs = {"eval_set":[(X_val, y_val)]}
+        fit_kwargs = {"eval_set":[(Xv, y_val)]}
         if sw is not None: fit_kwargs["sample_weight"] = sw
         if model_name == "xgboost": fit_kwargs["verbose"] = False
-        model.fit(X_train, y_train, **fit_kwargs)
+        model.fit(Xt, y_train, **fit_kwargs)
     else:
-        model.fit(X_train, y_train, **({"sample_weight":sw} if sw is not None else {}))
+        model.fit(Xt, y_train, **({"sample_weight":sw} if sw is not None else {}))
     return model
 
 
@@ -819,6 +831,11 @@ def tune_model_bayesian(model_name, X_train, y_train,
                 Xt, yt = pd.concat([X_train.iloc[:vs],X_train.iloc[ve:]]), pd.concat([y_train.iloc[:vs],y_train.iloc[ve:]])
                 med = Xt.median()
                 Xt, Xv = Xt.fillna(med), Xv.fillna(med)
+                # Scale for Ridge — fit on inner train fold only
+                if model_name == "ridge":
+                    _sc = StandardScaler()
+                    Xt  = pd.DataFrame(_sc.fit_transform(Xt), columns=Xt.columns)
+                    Xv  = pd.DataFrame(_sc.transform(Xv),     columns=Xv.columns)
                 model.fit(Xt, yt)
                 preds = model.predict(Xv)
                 if objective_metric == "spearman_r":
@@ -895,10 +912,29 @@ def log_run(run_name, metrics, params, importance_df=None):
 # S3 CHECKPOINTING  — write after every experiment, enable resume on failure
 # ══════════════════════════════════════════════════════════════════════════════
 _SM_BUCKET    = "amazon-sagemaker-575108933641-us-east-1-c422b90ce861"
-_SM_PREFIX    = "lmr-pipeline-v3-ward"  # hardcoded at upload time
+_SM_PREFIX    = os.environ.get("LMR_S3_PREFIX", "lmr-pipeline-v2-full")
 
-# Job name hardcoded at upload time — no env var lookup needed
-_JOB_NAME = "lmr-v3-20260402-070759"
+# Resolve job name — Processing Jobs write metadata to a known path
+def _resolve_job_name():
+    # Prefer explicit env var set by launcher, fall back to SageMaker env vars
+    for var in ["LMR_JOB_NAME", "TRAINING_JOB_NAME", "SAGEMAKER_JOB_NAME"]:
+        val = os.environ.get(var)
+        if val:
+            return val
+    # Try SageMaker config files
+    import json as _json, glob as _glob
+    for cfg_path in _glob.glob("/opt/ml/config/*.json"):
+        try:
+            with open(cfg_path) as f:
+                cfg = _json.load(f)
+            for key in ["ProcessingJobName", "TrainingJobName", "JobName"]:
+                if key in cfg and isinstance(cfg[key], str):
+                    return cfg[key]
+        except Exception:
+            pass
+    return "unknown"
+
+_JOB_NAME = _resolve_job_name()
 _CKPT_PREFIX  = f"{_SM_PREFIX}/checkpoints/{_JOB_NAME}"
 _s3_client    = None
 
@@ -1052,7 +1088,13 @@ def run_experiment(dataset_name, dataset_cfg, phase_name, feat_cols_static,
                     X_full = train_df[avail].fillna(med[avail])
                     y_full = train_df[label_col].fillna(0)
                     for mn in models_to_run:
-                        best_p, best_v = tune_model_bayesian(mn, X_full, y_full, tuning_obj, n_trials=n_trials)
+                        # Ridge tunes on scaled features — scaler fitted on X_full
+                        if mn == "ridge":
+                            _sc = StandardScaler()
+                            X_tune = pd.DataFrame(_sc.fit_transform(X_full), columns=X_full.columns)
+                        else:
+                            X_tune = X_full
+                        best_p, best_v = tune_model_bayesian(mn, X_tune, y_full, tuning_obj, n_trials=n_trials)
                         best_params_per_model[mn] = best_p
                         print(f"    Tuned {mn} ({tuning_obj}={best_v:.4f})")
 
@@ -1081,6 +1123,11 @@ def run_experiment(dataset_name, dataset_cfg, phase_name, feat_cols_static,
             sw      = train_df["sample_weight"].values if "sample_weight" in train_df.columns else None
             drought = val_df["is_drought_year"].values if "is_drought_year" in val_df.columns else None
 
+            # Scale for Ridge — fit on training fold only, apply to val
+            _fold_scaler   = StandardScaler()
+            X_train_scaled = pd.DataFrame(_fold_scaler.fit_transform(X_train), columns=avail)
+            X_val_scaled   = pd.DataFrame(_fold_scaler.transform(X_val),       columns=avail)
+
             fold_preds  = {}
             fold_scores = {}
 
@@ -1088,8 +1135,12 @@ def run_experiment(dataset_name, dataset_cfg, phase_name, feat_cols_static,
                 try:
                     params = best_params_per_model.get(mn)
                     model  = fit_model(mn, X_train, y_train, X_val, y_val,
-                                       sample_weight=sw, params=params)
-                    preds           = model.predict(X_val)
+                                       sample_weight=sw, params=params,
+                                       X_train_scaled=X_train_scaled,
+                                       X_val_scaled=X_val_scaled)
+                    # Predict using scaled inputs for Ridge, raw for tree models
+                    X_pred          = X_val_scaled if mn == "ridge" else X_val
+                    preds           = model.predict(X_pred)
                     fold_preds[mn]  = preds
                     sp_r, _         = stats.spearmanr(y_val, preds)
                     fold_scores[mn] = float(sp_r) if np.isfinite(sp_r) else 0.0
@@ -1323,6 +1374,11 @@ def evaluate_test_set(best_phase_name, best_tuning_obj, results_df, importance_d
             y_test   = test_df[label_col].fillna(0)
             drought  = test_df["is_drought_year"].values if "is_drought_year" in test_df.columns else None
 
+            # Scale for Ridge — fit on training data only
+            _test_scaler   = StandardScaler()
+            X_train_scaled = pd.DataFrame(_test_scaler.fit_transform(X_train), columns=avail)
+            X_test_scaled  = pd.DataFrame(_test_scaler.transform(X_test),      columns=avail)
+
             # Get best params from tuning (use results from best fold if available)
             best_params = {}
             fold_preds  = {}
@@ -1330,8 +1386,13 @@ def evaluate_test_set(best_phase_name, best_tuning_obj, results_df, importance_d
 
             for mn in CONFIG["models_to_run"]:
                 try:
-                    model = fit_model(mn, X_train, y_train, X_test, y_test, params=best_params.get(mn))
-                    preds = model.predict(X_test)
+                    model = fit_model(mn, X_train, y_train, X_test, y_test,
+                                      params=best_params.get(mn),
+                                      X_train_scaled=X_train_scaled,
+                                      X_val_scaled=X_test_scaled)
+                    # Predict using scaled inputs for Ridge
+                    X_pred = X_test_scaled if mn == "ridge" else X_test
+                    preds = model.predict(X_pred)
                     fold_preds[mn]  = preds
                     sp_r, _         = stats.spearmanr(y_test, preds)
                     fold_scores[mn] = float(sp_r) if np.isfinite(sp_r) else 0.0
