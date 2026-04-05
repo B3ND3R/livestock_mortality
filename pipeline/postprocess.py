@@ -309,6 +309,10 @@ def run_postprocess(
     top_n_features: int = 5,
     risk_thresholds: Optional[Dict[str, Tuple[float, float]]] = None,
     geotiff_resolution: float = 0.01,
+    output_s3_prefix: Optional[str] = None,
+    granularity: str = "household",
+    compute_shap: bool = True,
+    training_label_mean: Optional[float] = None,
 ) -> Tuple[str, str, str]:
     """
     Postprocess model predictions by aggregating to ADMIN3 ward level.
@@ -346,6 +350,22 @@ def run_postprocess(
     -------
     geotiff_resolution : float
         GeoTIFF pixel size in degrees (default 0.01 ≈ 1.1 km at equator).
+    output_s3_prefix : str, optional
+        Explicit base S3 URI for output files. When None (default), outputs
+        are written alongside the predictions file (existing behaviour).
+    granularity : str
+        "ward"      — input is already at ward level (skips spatial join and
+                      GPS column requirement; ward_name column used directly).
+        "household" — input is household-level with GPS coords (default,
+                      existing behaviour).
+    compute_shap : bool
+        When False, skip SHAP computation (faster; top_features will be "[]").
+        Default True.
+    training_label_mean : float, optional
+        When provided, use this value as the global mean for risk-level
+        thresholds instead of computing it from the prediction distribution.
+        Recommended for ward-level inference so thresholds are anchored to
+        the training label distribution.
 
     Returns
     -------
@@ -387,13 +407,18 @@ def run_postprocess(
         with mlflow.start_run(run_name="PostProcessing", nested=True):
 
             # ── 1. Load predictions ──────────────────────────────────────
-            pred_df = pd.read_csv(predictions_s3_path)
+            # Ward-level data may be parquet; household-level is CSV.
+            if predictions_s3_path.endswith(".parquet"):
+                pred_df = pd.read_parquet(predictions_s3_path)
+            else:
+                pred_df = pd.read_csv(predictions_s3_path)
             print(f"Loaded {len(pred_df)} predictions from {predictions_s3_path}")
 
-            coord_cols = [lat_column, lon_column]
-            missing_coords = [c for c in coord_cols if c not in pred_df.columns]
-            if missing_coords:
-                raise ValueError(f"Missing GPS columns in predictions file: {missing_coords}")
+            if granularity == "household":
+                coord_cols = [lat_column, lon_column]
+                missing_coords = [c for c in coord_cols if c not in pred_df.columns]
+                if missing_coords:
+                    raise ValueError(f"Missing GPS columns in predictions file: {missing_coords}")
 
             # Generate predictions inline if prediction column is absent
             available_features = [f for f in feature_names if f in pred_df.columns]
@@ -405,40 +430,67 @@ def run_postprocess(
                     pred_df[available_features]
                 )
 
-            global_mean = float(pred_df[prediction_column].mean())
-            print(f"Global mean prediction: {global_mean:.6f}")
+            # Use training label mean when provided so risk thresholds are
+            # anchored to the training distribution rather than this batch.
+            if training_label_mean is not None:
+                global_mean = float(training_label_mean)
+                print(f"Using training_label_mean as global mean: {global_mean:.6f}")
+            else:
+                global_mean = float(pred_df[prediction_column].mean())
+                print(f"Global mean prediction: {global_mean:.6f}")
 
             # ── 2. Load ADMIN3 boundaries ────────────────────────────────
             admin3 = load_admin3_boundaries(admin3_shapefile_path)
             print(f"Loaded {len(admin3)} ADMIN3 ward boundaries")
 
-            # ── 3. Spatial join: points → wards ──────────────────────────
-            geometry = [
-                Point(lon, lat)
-                for lon, lat in zip(pred_df[lon_column], pred_df[lat_column])
-            ]
-            points_gdf = gpd.GeoDataFrame(pred_df, geometry=geometry, crs="EPSG:4326")
-
-            joined = gpd.sjoin(points_gdf, admin3, how="left", predicate="within")
-
-            unmatched = int(joined["ADM3_PCODE"].isna().sum())
-            if unmatched > 0:
-                print(f"Warning: {unmatched}/{len(joined)} points outside ward boundaries — using nearest ward")
-                unmatched_idx = joined[joined["ADM3_PCODE"].isna()].index
-                unmatched_pts = points_gdf.loc[unmatched_idx]
-                nearest = gpd.sjoin_nearest(
-                    unmatched_pts, admin3, how="left", distance_col="_dist"
+            # ── 3. Spatial join (household) or direct merge (ward) ───────
+            if granularity == "ward":
+                # Data is already at ward level — join on ward_name to get
+                # ADM3 codes and geometry; no GPS columns needed.
+                if "ward_name" not in pred_df.columns:
+                    raise ValueError(
+                        "granularity='ward' requires a 'ward_name' column in predictions."
+                    )
+                joined = pred_df.merge(
+                    admin3.rename(columns={"ADM3_EN": "ward_name"})[
+                        ["ward_name", "ADM3_PCODE", "ADM2_EN", "ADM1_EN"]
+                    ],
+                    on="ward_name",
+                    how="left",
                 )
-                for col in ["ADM3_EN", "ADM3_PCODE", "ADM2_EN", "ADM1_EN"]:
-                    joined.loc[unmatched_idx, col] = nearest[col].values
+                unmatched = int(joined["ADM3_PCODE"].isna().sum())
+                if unmatched > 0:
+                    print(f"Warning: {unmatched} ward(s) could not be matched to ADMIN3 boundaries")
+                mlflow.log_metric("unmatched_wards", unmatched)
+                mlflow.log_metric("total_wards", len(joined))
+            else:
+                # Household granularity — spatial join points to polygons
+                geometry = [
+                    Point(lon, lat)
+                    for lon, lat in zip(pred_df[lon_column], pred_df[lat_column])
+                ]
+                points_gdf = gpd.GeoDataFrame(pred_df, geometry=geometry, crs="EPSG:4326")
 
-            mlflow.log_metric("unmatched_points", unmatched)
-            mlflow.log_metric("total_points", len(joined))
+                joined = gpd.sjoin(points_gdf, admin3, how="left", predicate="within")
+
+                unmatched = int(joined["ADM3_PCODE"].isna().sum())
+                if unmatched > 0:
+                    print(f"Warning: {unmatched}/{len(joined)} points outside ward boundaries — using nearest ward")
+                    unmatched_idx = joined[joined["ADM3_PCODE"].isna()].index
+                    unmatched_pts = points_gdf.loc[unmatched_idx]
+                    nearest = gpd.sjoin_nearest(
+                        unmatched_pts, admin3, how="left", distance_col="_dist"
+                    )
+                    for col in ["ADM3_EN", "ADM3_PCODE", "ADM2_EN", "ADM1_EN"]:
+                        joined.loc[unmatched_idx, col] = nearest[col].values
+
+                mlflow.log_metric("unmatched_points", unmatched)
+                mlflow.log_metric("total_points", len(joined))
 
             # ── 4. Compute SHAP values ───────────────────────────────────
             shap_df = None
 
-            if available_features:
+            if compute_shap and available_features:
                 try:
                     model_uri = f"runs:/{training_run_id}/model"
                     raw_model = mlflow.sklearn.load_model(model_uri)
@@ -450,6 +502,8 @@ def run_postprocess(
                     print(f"Computed SHAP values for {len(available_features)} features")
                 except Exception as e:
                     print(f"SHAP computation skipped: {e}")
+            elif not compute_shap:
+                print("SHAP computation skipped (compute_shap=False)")
 
             # ── 5. Aggregate per ward ────────────────────────────────────
             ward_results = []
@@ -459,7 +513,7 @@ def run_postprocess(
 
                 ward_info = {
                     "ADM3_PCODE": pcode,
-                    "ADM3_EN": group["ADM3_EN"].iloc[0],
+                    "ADM3_EN": group["ADM3_EN"].iloc[0] if "ADM3_EN" in group.columns else group.get("ward_name", pd.Series([pcode])).iloc[0],
                     "ADM2_EN": group["ADM2_EN"].iloc[0],
                     "ADM1_EN": group["ADM1_EN"].iloc[0],
                     "mean_predicted_loss_ratio": round(mean_score, 6),
@@ -505,6 +559,8 @@ def run_postprocess(
                     {k: list(v) for k, v in thresholds.items()}
                 ),
                 "global_mean_prediction": round(global_mean, 6),
+                "granularity": granularity,
+                "compute_shap": compute_shap,
             })
             mlflow.log_metrics({
                 "mean_ward_confidence": float(ward_df["confidence"].mean()),
@@ -541,7 +597,11 @@ def run_postprocess(
             # ── 7. Write outputs to S3 ───────────────────────────────────
             import s3fs
 
-            base_dir = predictions_s3_path.rsplit("/", 1)[0]
+            if output_s3_prefix is not None:
+                base_dir = output_s3_prefix.rstrip("/")
+            else:
+                base_dir = predictions_s3_path.rsplit("/", 1)[0]
+
             csv_s3 = f"{base_dir}/ward_predictions.csv"
             geojson_s3 = f"{base_dir}/ward_predictions.geojson"
             geotiff_s3 = f"{base_dir}/ward_predictions.tif"
