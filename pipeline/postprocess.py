@@ -83,6 +83,16 @@ def load_admin3_boundaries(shapefile_path: str) -> "gpd.GeoDataFrame":
             if req.upper() in col_map:
                 gdf = gdf.rename(columns={col_map[req.upper()]: req})
 
+        # Fallback: geoBoundaries format (shapeName, shapeID, etc.)
+        geo_boundaries_map = {
+            "ADM3_EN": "shapeName",
+            "ADM3_PCODE": "shapeID",
+        }
+        still_missing = [c for c in required if c not in gdf.columns]
+        rename = {geo_boundaries_map[req]: req for req in still_missing if geo_boundaries_map.get(req) in gdf.columns}
+        if rename:
+            gdf = gdf.rename(columns=rename)
+
         # Fallback: explicit mapping for Kenya IEBC wards shapefile column names
         iebc_col_map = {
             "ADM3_EN": "IEBC_WARDS",
@@ -94,6 +104,11 @@ def load_admin3_boundaries(shapefile_path: str) -> "gpd.GeoDataFrame":
         rename = {iebc_col_map[req]: req for req in still_missing if iebc_col_map.get(req) in gdf.columns}
         if rename:
             gdf = gdf.rename(columns=rename)
+
+        # Fill any remaining missing admin columns with "Unknown"
+        for col in ["ADM2_EN", "ADM1_EN"]:
+            if col not in gdf.columns:
+                gdf[col] = "Unknown"
 
     still_missing = [c for c in required if c not in gdf.columns]
     if still_missing:
@@ -533,6 +548,10 @@ def run_postprocess(
                         )
                     else:
                         ward_info["top_features"] = "[]"
+                elif "top_features" in group.columns:
+                    # Pre-computed top features (ward-level inference path)
+                    val = group["top_features"].iloc[0]
+                    ward_info["top_features"] = val if pd.notna(val) else "[]"
                 else:
                     ward_info["top_features"] = "[]"
 

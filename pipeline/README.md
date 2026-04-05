@@ -8,9 +8,7 @@ This directory contains two pipelines:
 2. **Inference pipeline** — runs the trained model on new satellite data to produce ward-level risk maps (GeoJSON + GeoTIFF).
 
 ---
-
-## Training Pipeline
-
+## EDA
 ### Prerequisites
 
 #### Data Directory Structure
@@ -28,12 +26,8 @@ Assumes Kenya survey (IBLI) data is organized in the following directory structu
     └── S9B Other Assistance.csv
 ```
 
-### Create Training Dataset
-```sh
-cd pipeline
-pixi run prepare_targets.py
-```
-Creates `data/target_data_pipeline.csv`
+## Training Pipeline
+Run using `livestock_mortality/pipeline/sagemaker_pipelines_mlflow_updated.ipynb`. Calls modules to pre- and post-process data.
 
 ---
 

@@ -529,6 +529,7 @@ def run_extraction(
     time_start: str,
     time_end: str,
     output_prefix: str,
+    skip_collections: Optional[set] = None,
 ) -> pd.DataFrame:
     """
     Extract all collections for the given time range and ward centroids.
@@ -560,6 +561,9 @@ def run_extraction(
     for var_name, (stem, crs, res_m, ctype) in COLLECTIONS.items():
         if ctype not in ("temporal", "static"):
             continue
+        if skip_collections and var_name in skip_collections:
+            log.info("[skip] %s -- excluded via --skip-collections", var_name)
+            continue
         ck = f"{output_prefix}/extracted/{var_name}.parquet"
         if s3_exists(ck):
             log.info("[skip] %s -- cache hit", var_name)
@@ -577,7 +581,9 @@ def run_extraction(
             log.error("FAILED %s: %s", var_name, e, exc_info=True)
 
     ck = f"{output_prefix}/extracted/worldcover.parquet"
-    if s3_exists(ck):
+    if skip_collections and "worldcover" in skip_collections:
+        log.info("[skip] worldcover -- excluded via --skip-collections")
+    elif s3_exists(ck):
         log.info("[skip] worldcover -- cache hit")
         extracted["worldcover"] = s3_load_parquet(ck)
     else:
@@ -642,6 +648,26 @@ def tier0_preprocess(df: pd.DataFrame) -> pd.DataFrame:
 
 def tier1_direct_indices(df: pd.DataFrame) -> pd.DataFrame:
     log.info("Tier 1: Direct indices...")
+
+    # ── Rename chirps → ppt (training convention) ────────────────────────────
+    if "chirps" in df.columns and "ppt" not in df.columns:
+        df = df.rename(columns={"chirps": "ppt"})
+        log.info("  Renamed chirps → ppt")
+
+    # ── Soil moisture composites ─────────────────────────────────────────────
+    if all(c in df.columns for c in ["swvl1", "swvl2", "swvl3", "swvl4"]):
+        df["soil_composite"] = (
+            0.4 * df["swvl1"] + 0.3 * df["swvl2"]
+            + 0.2 * df["swvl3"] + 0.1 * df["swvl4"]
+        )
+        df["soil_shallow_deep"] = (
+            df["swvl1"] / df["swvl4"].replace(0, np.nan)
+        ).clip(0, 10)
+        # Per-ward monthly anomaly
+        W_MONTH = ["ward_name", "ward_lon", "ward_lat", "month"]
+        clim_mean = df.groupby(W_MONTH)["soil_composite"].transform("mean")
+        df["soil_composite_anom"] = df["soil_composite"] - clim_mean
+        log.info("  soil_composite, soil_shallow_deep, soil_composite_anom")
 
     if all(c in df.columns for c in ["sr_nir", "sr_red"]):
         nir, red = df["sr_nir"], df["sr_red"]
@@ -715,6 +741,7 @@ def tier2_temporal_windows(df: pd.DataFrame) -> pd.DataFrame:
         "lai", "fpar", "sr_nir", "sr_red",
         "sar_rvi", "sar_vv_vh_ratio", "s1_vv", "s1_vh",
         "et_deficit", "et_fraction", "lst_diurnal_range",
+        "ppt", "soil_composite",
     ] if c in df.columns]
 
     for col in TEMPORAL_VARS:
@@ -955,6 +982,7 @@ def main(
     scheme: Optional[str] = None,
     bbox: Optional[tuple] = (36.0, 1.2, 39.0, 4.5),
     n_points: int = N_SAMPLE_POINTS,
+    skip_collections: Optional[set] = None,
 ):
     if output_prefix is None:
         output_prefix = (
@@ -971,7 +999,8 @@ def main(
     log.info("=" * 60)
 
     wards = sample_ward_points(n_points=n_points, bbox=bbox)
-    df    = run_extraction(wards, time_start, time_end, output_prefix)
+    df    = run_extraction(wards, time_start, time_end, output_prefix,
+                           skip_collections=skip_collections)
     df    = run_feature_engineering(df, wards)
 
     feat_cols = [
@@ -1022,6 +1051,8 @@ if __name__ == "__main__":
                         help="Number of grid sample points per ward polygon")
     parser.add_argument("--no-bbox",           action="store_true",
                         help="Disable Marsabit bounding box filter (use all wards)")
+    parser.add_argument("--skip-collections",  nargs="*", default=None,
+                        help="Collection names to skip during extraction (e.g. s1_vv s1_vh)")
     args = parser.parse_args()
 
     bbox = None if args.no_bbox else (36.0, 1.2, 39.0, 4.5)
@@ -1032,4 +1063,5 @@ if __name__ == "__main__":
         scheme=args.scheme,
         bbox=bbox,
         n_points=args.n_sample_points,
+        skip_collections=set(args.skip_collections) if args.skip_collections else None,
     )
