@@ -102,45 +102,132 @@ loading the full pixel parquet and running the spatial join per variable
 
 ### Stage 2 — Model Inference (SageMaker Pipeline)
 
-Once the ward feature parquets are in S3, run the SageMaker inference pipeline
-from `inference_pipeline.ipynb`.
+Once the ward feature parquets are in S3, run the SageMaker inference pipeline.
+The recommended entry point for running all three schemes in one command is
+`run_inference_all_schemes.py`. The notebook `inference_pipeline.ipynb` can also
+be used to run a single scheme manually.
 
-The pipeline has three `@step` functions:
+#### Season schemes
+
+Stage 1 produces one parquet per scheme. Each scheme aggregates the underlying
+monthly ward features differently:
+
+| Scheme | Seasons per year | Season labels | Time columns in parquet |
+|--------|-----------------|---------------|------------------------|
+| `biannual` | 2 | `MAM` (Mar–May), `OND` (Oct–Dec) | `season`, `season_year` |
+| `quadseasonal` | 4 | `LRLD`, `MAM`, `SRSD`, `OND` | `season`, `season_year` |
+| `monthly` | 12 | Jan–Dec | `year`, `month` |
+
+`season_year` follows the meteorological convention: January and February belong
+to the previous year's season for SRSD/SRS_dry schemes.
+
+#### SageMaker pipeline steps
 
 | Step | Script | Input | Output |
 |------|--------|-------|--------|
-| `InferencePreprocess` | `inference_preprocess.py` | Ward feature parquet | Imputed features (raw + Ridge-scaled) |
+| `InferencePreprocess` | `inference_preprocess.py` | Ward feature parquet | Imputed features (raw + Ridge-scaled) + metadata parquet |
 | `ModelInference` | `inference.py` | Preprocessed features | `predictions_with_metadata.parquet` |
-| `InferencePostprocess` | `postprocess.py` | Predictions | GeoJSON + GeoTIFF + CSV |
+| `InferencePostprocess` | `postprocess.py` | Predictions parquet | Per-timepoint GeoJSON + GeoTIFF + CSV |
 
-#### Running the pipeline
+All steps run on `ml.m5.xlarge` instances (configurable via `InferenceInstanceType`).
 
-Open `inference_pipeline.ipynb` and set the parameters in the **Pipeline Parameters** cell:
+#### Ensemble model
 
-| Parameter | Description | Example |
-|-----------|-------------|---------|
-| `InputDataS3Path` | S3 URI to the ward feature parquet from Stage 1 | `s3://.../ward_features_biannual.parquet` |
-| `ModelS3Prefix` | S3 prefix containing `biannual/`, `quadseasonal/`, `monthly/` model folders | `s3://.../lmr_example_models` |
-| `SeasonScheme` | Must match the parquet from Stage 1 | `biannual` |
-| `OutputS3Prefix` | Where to write GeoJSON, GeoTIFF, and CSV results | `s3://.../inference-outputs` |
+Each scheme folder under `ModelS3Prefix` contains four independently trained
+models plus a weight file:
 
-Then run all cells. The final cell starts the SageMaker Pipeline execution and waits for completion.
+```
+lmr_example_models/<scheme>/
+  xgboost_model.joblib
+  lgbm_model.joblib
+  rf_model.joblib
+  ridge_model.joblib
+  ensemble_weights.json      # e.g. {"xgboost": 0.4, "lgbm": 0.3, "rf": 0.2, "ridge": 0.1}
+  feature_names.json
+  feature_scaler.joblib      # StandardScaler applied to Ridge inputs only
+  train_medians.json         # Per-feature medians used for NaN imputation
+  run_metadata.json          # Includes label_mean for risk-level thresholds
+```
 
-#### End-to-end example (biannual, 2023)
+At inference time the weights are normalized to sum to 1 and a weighted average
+is taken across all four model predictions. Models with weight 0 are skipped.
+Ridge receives Ridge-scaled features (`feature_scaler.joblib`); XGBoost, LightGBM
+and RF receive raw median-imputed features.
+
+#### Outputs — per-timepoint subdirectories
+
+`InferencePostprocess` splits predictions by timepoint and writes a separate set
+of output files for each season or month under the `OutputS3Prefix`:
+
+```
+<OutputS3Prefix>/
+  2019OND/
+    ward_predictions.csv      # one row per ward: risk_level, confidence, top SHAP features
+    ward_predictions.geojson  # same with ward geometries
+    ward_predictions.tif      # 3-band GeoTIFF (see below)
+  2020MAM/
+    ward_predictions.csv / .geojson / .tif
+  ...
+```
+
+For monthly scheme the subdirectory names are `<year><MonthAbbr>` (e.g. `2019Jan`);
+for biannual/quadseasonal they are `<season_year><season>` (e.g. `2019OND`).
+
+**GeoTIFF bands:**
+
+| Band | Field | Type | No-data |
+|------|-------|------|---------|
+| 1 | `risk_level_encoded` | float32 — 0=Normal, 1=Concerning, 2=Critical | −9999 |
+| 2 | `confidence` | float32 0–1 | −9999 |
+| 3 | `top_feature_importance` | float32 — mean \|SHAP\| of #1 feature per ward | −9999 |
+
+**Risk levels** are assigned relative to the training label mean (anchored via
+`run_metadata.json`) so thresholds are consistent across time windows:
+
+| Level | Condition |
+|-------|-----------|
+| Normal | ward mean ≤ 10% above training mean |
+| Concerning | 10–20% above training mean |
+| Critical | > 20% above training mean |
+
+#### Running all three schemes
 
 ```sh
-# Stage 1 — extract features
-python inference_ward_feature_pipeline.py \
-    --scheme biannual \
-    --time-start 2022-07 \
-    --time-end 2023-06 \
-    --output-prefix dzd-.../dev/data/inference/ward_features_2023_biannual
+# Edit FEATURE_WINDOW and PERIOD_LABEL at the top of the script, then:
+python run_inference_all_schemes.py
 ```
 
-Then in `inference_pipeline.ipynb`, set:
-```python
-InputDataS3Path = "s3://<bucket>/dzd-.../dev/data/inference/ward_features_2023_biannual/ward_features_biannual.parquet"
-ModelS3Prefix   = "s3://<bucket>/dzd-.../shared/lmr_example_models"
-SeasonScheme    = "biannual"
-OutputS3Prefix  = "s3://<bucket>/dzd-.../dev/outputs/inference-outputs/2023-biannual"
+The script upserts the pipeline once and starts three parallel executions
+(one per scheme), then waits for all three to complete.
+
+#### End-to-end example (2019–2020)
+
+```sh
+# Stage 1 — set --time-start 3 months before first season of interest
+python inference_ward_feature_pipeline.py \
+    --time-start 2018-10 \
+    --time-end 2020-12 \
+    --skip-collections s1_vv s1_vh s2_red s2_nir s2_swir1
 ```
+
+Stage 1 outputs (S3):
+```
+ward_features_2018-10_2020-12/ward_features_biannual.parquet
+ward_features_2018-10_2020-12/ward_features_quadseasonal.parquet
+ward_features_2018-10_2020-12/ward_features_monthly.parquet
+```
+
+Then set `FEATURE_WINDOW = "2018-10_2020-12"` and `PERIOD_LABEL = "2019-2020"` in
+`run_inference_all_schemes.py` and run it. Outputs land at:
+```
+dev/outputs/2019-2020-biannual/2019OND/ward_predictions.{csv,geojson,tif}
+dev/outputs/2019-2020-biannual/2020MAM/ward_predictions.{csv,geojson,tif}
+dev/outputs/2019-2020-quadseasonal/2019LRLD/...
+dev/outputs/2019-2020-monthly/2019Jan/...
+dev/outputs/2019-2020-monthly/2019Feb/...
+...
+```
+
+> **Note:** Skip `s1_vv`, `s1_vh` (~1–1.2 GB each) and `s2_red`, `s2_nir`,
+> `s2_swir1` (~600 MB each) — these are not used by the 29 model features and
+> will OOM the instance if loaded.
