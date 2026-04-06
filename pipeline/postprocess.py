@@ -186,6 +186,30 @@ def compute_shap_values(
     return pd.DataFrame(shap_values, columns=feature_names, index=X.index)
 
 
+def _get_time_cols(season_scheme: str) -> List[str]:
+    """Return the time-grouping columns for this season scheme."""
+    if season_scheme == "monthly":
+        return ["year", "month"]
+    return ["season_year", "season"]
+
+
+def _timepoint_label(time_key, season_scheme: str) -> str:
+    """Convert a groupby time key to a directory-friendly label.
+
+    Examples
+    --------
+    monthly      : (2019, 1)     → "2019Jan"
+    biannual     : (2019, "OND") → "2019OND"
+    quadseasonal : (2019, "MAM") → "2019MAM"
+    """
+    import calendar
+    if season_scheme == "monthly":
+        year, month = time_key
+        return f"{int(year)}{calendar.month_abbr[int(month)]}"
+    season_year, season = time_key
+    return f"{int(season_year)}{season}"
+
+
 def rasterize_ward_predictions(
     ward_geo: "gpd.GeoDataFrame",
     output_path: str,
@@ -328,7 +352,8 @@ def run_postprocess(
     granularity: str = "household",
     compute_shap: bool = True,
     training_label_mean: Optional[float] = None,
-) -> Tuple[str, str, str]:
+    season_scheme: str = "monthly",
+) -> Tuple[str, List[str]]:
     """
     Postprocess model predictions by aggregating to ADMIN3 ward level.
 
@@ -381,15 +406,18 @@ def run_postprocess(
         thresholds instead of computing it from the prediction distribution.
         Recommended for ward-level inference so thresholds are anchored to
         the training label distribution.
+    season_scheme : str
+        One of "biannual", "quadseasonal", "monthly". Determines which time
+        columns are used to split outputs into per-timepoint subdirectories
+        under output_s3_prefix (e.g. 2019Jan/, 2019OND/).
 
     Returns
     -------
-    ward_csv_s3_path : str
-        S3 path to ward-level predictions CSV.
-    ward_geojson_s3_path : str
-        S3 path to ward-level predictions GeoJSON.
-    ward_geotiff_s3_path : str
-        S3 path to 3-band GeoTIFF (risk_level / confidence / top_feature_importance).
+    base_s3_prefix : str
+        Base S3 prefix under which all per-timepoint subdirectories were written.
+    output_dirs : list[str]
+        List of per-timepoint S3 prefixes (one per season/month), each containing
+        ward_predictions.csv, ward_predictions.geojson, ward_predictions.tif.
     """
     import geopandas as gpd
     import mlflow
@@ -514,65 +542,34 @@ def run_postprocess(
                         raw_model, pred_df, available_features
                     )
                     shap_df["ADM3_PCODE"] = joined["ADM3_PCODE"].values
+                    for _tc in _get_time_cols(season_scheme):
+                        if _tc in joined.columns:
+                            shap_df[_tc] = joined[_tc].values
                     print(f"Computed SHAP values for {len(available_features)} features")
                 except Exception as e:
                     print(f"SHAP computation skipped: {e}")
             elif not compute_shap:
                 print("SHAP computation skipped (compute_shap=False)")
 
-            # ── 5. Aggregate per ward ────────────────────────────────────
-            ward_results = []
-            for pcode, group in joined.groupby("ADM3_PCODE"):
-                preds = group[prediction_column]
-                mean_score = float(preds.mean())
+            # ── 5. Resolve output base dir ───────────────────────────────
+            import s3fs
+            fs = s3fs.S3FileSystem()
 
-                ward_info = {
-                    "ADM3_PCODE": pcode,
-                    "ADM3_EN": group["ADM3_EN"].iloc[0] if "ADM3_EN" in group.columns else group.get("ward_name", pd.Series([pcode])).iloc[0],
-                    "ADM2_EN": group["ADM2_EN"].iloc[0],
-                    "ADM1_EN": group["ADM1_EN"].iloc[0],
-                    "mean_predicted_loss_ratio": round(mean_score, 6),
-                    "median_predicted_loss_ratio": round(float(preds.median()), 6),
-                    "max_predicted_loss_ratio": round(float(preds.max()), 6),
-                    "n_observations": int(len(preds)),
-                    "risk_level": assign_risk_level(mean_score, global_mean, thresholds),
-                    "confidence": compute_ward_confidence(preds),
-                }
+            if output_s3_prefix is not None:
+                base_dir = output_s3_prefix.rstrip("/")
+            else:
+                base_dir = predictions_s3_path.rsplit("/", 1)[0]
 
-                # Top SHAP features for this ward
-                if shap_df is not None:
-                    ward_shap = shap_df[shap_df["ADM3_PCODE"] == pcode][available_features]
-                    if len(ward_shap) > 0:
-                        ward_info["top_features"] = json.dumps(
-                            aggregate_top_features(ward_shap, top_n=top_n_features)
-                        )
-                    else:
-                        ward_info["top_features"] = "[]"
-                elif "top_features" in group.columns:
-                    # Pre-computed top features (ward-level inference path)
-                    val = group["top_features"].iloc[0]
-                    ward_info["top_features"] = val if pd.notna(val) else "[]"
-                else:
-                    ward_info["top_features"] = "[]"
+            # ── 6. Determine timepoints ──────────────────────────────────
+            time_cols = _get_time_cols(season_scheme)
+            available_time_cols = [c for c in time_cols if c in joined.columns]
 
-                ward_results.append(ward_info)
+            if available_time_cols:
+                timepoint_iter = list(joined.groupby(available_time_cols))
+            else:
+                timepoint_iter = [("all", joined)]
 
-            ward_df = pd.DataFrame(ward_results)
-
-            # Merge geometry back for GeoJSON output
-            ward_geo = admin3.merge(
-                ward_df, on="ADM3_PCODE", how="inner", suffixes=("", "_agg")
-            )
-            for col in ["ADM3_EN_agg", "ADM2_EN_agg", "ADM1_EN_agg"]:
-                if col in ward_geo.columns:
-                    ward_geo = ward_geo.drop(columns=[col])
-
-            print(f"Aggregated predictions for {len(ward_df)} wards")
-            print(f"Risk distribution:\n{ward_df['risk_level'].value_counts().to_string()}")
-
-            # ── 6. Log to MLflow ─────────────────────────────────────────
             mlflow.log_params({
-                "n_wards_with_predictions": int(len(ward_df)),
                 "top_n_features": top_n_features,
                 "risk_thresholds": json.dumps(
                     {k: list(v) for k, v in thresholds.items()}
@@ -580,71 +577,95 @@ def run_postprocess(
                 "global_mean_prediction": round(global_mean, 6),
                 "granularity": granularity,
                 "compute_shap": compute_shap,
-            })
-            mlflow.log_metrics({
-                "mean_ward_confidence": float(ward_df["confidence"].mean()),
-                "pct_critical_risk": float(
-                    (ward_df["risk_level"] == "Critical").mean()
-                ),
-                "pct_concerning_or_critical": float(
-                    ward_df["risk_level"].isin(["Concerning", "Critical"]).mean()
-                ),
+                "season_scheme": season_scheme,
+                "n_timepoints": len(timepoint_iter),
             })
 
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                csv_path = os.path.join(tmp_dir, "ward_predictions.csv")
-                ward_df.to_csv(csv_path, index=False)
-                mlflow.log_artifact(csv_path, artifact_path="postprocessing")
+            output_dirs = []
 
-                geojson_path = os.path.join(tmp_dir, "ward_predictions.geojson")
-                ward_geo.to_file(geojson_path, driver="GeoJSON")
-                mlflow.log_artifact(geojson_path, artifact_path="postprocessing")
-
-                geotiff_path = os.path.join(tmp_dir, "ward_predictions.tif")
-                rasterize_ward_predictions(
-                    ward_geo,
-                    output_path=geotiff_path,
-                    resolution=geotiff_resolution,
+            # ── 7. Per-timepoint aggregation and output ──────────────────
+            for tp_idx, (time_key, time_grp) in enumerate(timepoint_iter):
+                tp_label = (
+                    _timepoint_label(time_key, season_scheme)
+                    if available_time_cols else "all"
                 )
-                mlflow.log_artifact(geotiff_path, artifact_path="postprocessing")
+                tp_prefix = f"{base_dir}/{tp_label}"
+                output_dirs.append(tp_prefix)
 
-                print("Logged MLflow artifacts:")
-                print(" - postprocessing/ward_predictions.csv")
-                print(" - postprocessing/ward_predictions.geojson")
-                print(" - postprocessing/ward_predictions.tif")
+                # Aggregate per ward
+                ward_results = []
+                for pcode, group in time_grp.groupby("ADM3_PCODE"):
+                    preds = group[prediction_column]
+                    mean_score = float(preds.mean())
 
-            # ── 7. Write outputs to S3 ───────────────────────────────────
-            import s3fs
+                    ward_info = {
+                        "ADM3_PCODE": pcode,
+                        "ADM3_EN": group["ADM3_EN"].iloc[0] if "ADM3_EN" in group.columns else group.get("ward_name", pd.Series([pcode])).iloc[0],
+                        "ADM2_EN": group["ADM2_EN"].iloc[0],
+                        "ADM1_EN": group["ADM1_EN"].iloc[0],
+                        "mean_predicted_loss_ratio": round(mean_score, 6),
+                        "median_predicted_loss_ratio": round(float(preds.median()), 6),
+                        "max_predicted_loss_ratio": round(float(preds.max()), 6),
+                        "n_observations": int(len(preds)),
+                        "risk_level": assign_risk_level(mean_score, global_mean, thresholds),
+                        "confidence": compute_ward_confidence(preds),
+                    }
 
-            if output_s3_prefix is not None:
-                base_dir = output_s3_prefix.rstrip("/")
-            else:
-                base_dir = predictions_s3_path.rsplit("/", 1)[0]
+                    # Top SHAP features for this ward/timepoint
+                    if shap_df is not None:
+                        time_key_tuple = time_key if isinstance(time_key, tuple) else (time_key,)
+                        mask = shap_df["ADM3_PCODE"] == pcode
+                        for _tc, _tv in zip(available_time_cols, time_key_tuple):
+                            mask &= shap_df[_tc] == _tv
+                        ward_shap = shap_df[mask][available_features]
+                        ward_info["top_features"] = (
+                            json.dumps(aggregate_top_features(ward_shap, top_n=top_n_features))
+                            if len(ward_shap) > 0 else "[]"
+                        )
+                    elif "top_features" in group.columns:
+                        val = group["top_features"].iloc[0]
+                        ward_info["top_features"] = val if pd.notna(val) else "[]"
+                    else:
+                        ward_info["top_features"] = "[]"
 
-            csv_s3 = f"{base_dir}/ward_predictions.csv"
-            geojson_s3 = f"{base_dir}/ward_predictions.geojson"
-            geotiff_s3 = f"{base_dir}/ward_predictions.tif"
+                    ward_results.append(ward_info)
 
-            ward_df.to_csv(csv_s3, index=False)
+                ward_df = pd.DataFrame(ward_results)
 
-            # geopandas/fiona and rasterio may not support S3 URIs directly;
-            # write to temp files then upload via s3fs
-            fs = s3fs.S3FileSystem()
-
-            with tempfile.NamedTemporaryFile(suffix=".geojson", delete=True) as tmp:
-                ward_geo.to_file(tmp.name, driver="GeoJSON")
-                fs.put(tmp.name, geojson_s3)
-
-            with tempfile.NamedTemporaryFile(suffix=".tif", delete=True) as tmp:
-                rasterize_ward_predictions(
-                    ward_geo,
-                    output_path=tmp.name,
-                    resolution=geotiff_resolution,
+                # Merge geometry back for GeoJSON / GeoTIFF
+                ward_geo = admin3.merge(
+                    ward_df, on="ADM3_PCODE", how="inner", suffixes=("", "_agg")
                 )
-                fs.put(tmp.name, geotiff_s3)
+                for col in ["ADM3_EN_agg", "ADM2_EN_agg", "ADM1_EN_agg"]:
+                    if col in ward_geo.columns:
+                        ward_geo = ward_geo.drop(columns=[col])
 
-            print(f"Ward CSV:     {csv_s3}")
-            print(f"Ward GeoJSON: {geojson_s3}")
-            print(f"Ward GeoTIFF: {geotiff_s3}")
+                print(f"[{tp_label}] {len(ward_df)} wards — {ward_df['risk_level'].value_counts().to_dict()}")
 
-            return csv_s3, geojson_s3, geotiff_s3
+                # Write files once; use same files for MLflow and S3
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    csv_path     = os.path.join(tmp_dir, "ward_predictions.csv")
+                    geojson_path = os.path.join(tmp_dir, "ward_predictions.geojson")
+                    geotiff_path = os.path.join(tmp_dir, "ward_predictions.tif")
+
+                    ward_df.to_csv(csv_path, index=False)
+                    ward_geo.to_file(geojson_path, driver="GeoJSON")
+                    rasterize_ward_predictions(ward_geo, output_path=geotiff_path, resolution=geotiff_resolution)
+
+                    mlflow.log_artifacts(tmp_dir, artifact_path=f"postprocessing/{tp_label}")
+                    mlflow.log_metrics({
+                        "mean_ward_confidence": float(ward_df["confidence"].mean()),
+                        "pct_critical_risk": float((ward_df["risk_level"] == "Critical").mean()),
+                        "pct_concerning_or_critical": float(ward_df["risk_level"].isin(["Concerning", "Critical"]).mean()),
+                        "n_wards": float(len(ward_df)),
+                    }, step=tp_idx)
+
+                    # Upload to S3 subdirectory
+                    ward_df.to_csv(f"{tp_prefix}/ward_predictions.csv", index=False)
+                    fs.put(geojson_path, f"{tp_prefix}/ward_predictions.geojson")
+                    fs.put(geotiff_path, f"{tp_prefix}/ward_predictions.tif")
+
+                print(f"  -> {tp_prefix}/")
+
+            print(f"\nWritten {len(output_dirs)} timepoint(s) to {base_dir}/")
+            return base_dir, output_dirs

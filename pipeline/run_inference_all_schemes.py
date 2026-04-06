@@ -136,6 +136,7 @@ def inference_postprocess(
             granularity="ward",
             compute_shap=False,
             training_label_mean=training_label_mean,
+            season_scheme=season_scheme,
         )
 
 # ---------------------------------------------------------------------------
@@ -182,7 +183,7 @@ print(f"Pipeline '{pipeline_name}' upserted.")
 # ---------------------------------------------------------------------------
 # Start one execution per scheme
 # ---------------------------------------------------------------------------
-SCHEMES = ["monthly"]  # biannual + quadseasonal already succeeded
+SCHEMES = ["biannual", "quadseasonal", "monthly"]
 executions = []
 
 for scheme in SCHEMES:
