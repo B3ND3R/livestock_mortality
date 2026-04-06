@@ -126,7 +126,7 @@ def inference_postprocess(
         return run_postprocess(
             predictions_s3_path=predictions_s3_path,
             experiment_name=experiment_name,
-            run_id=run_id,
+            run_id=None,           # create a new MLflow run; SM execution ID is not a valid MLflow run ID
             training_run_id="",
             admin3_shapefile_path=bounds_local,
             prediction_column="prediction",
@@ -182,7 +182,7 @@ print(f"Pipeline '{pipeline_name}' upserted.")
 # ---------------------------------------------------------------------------
 # Start one execution per scheme
 # ---------------------------------------------------------------------------
-SCHEMES = ["biannual", "quadseasonal", "monthly"]
+SCHEMES = ["monthly"]  # biannual + quadseasonal already succeeded
 executions = []
 
 for scheme in SCHEMES:

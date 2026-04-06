@@ -171,8 +171,7 @@ def _detect_metadata_columns(df: "pd.DataFrame", season_scheme: str) -> list:
     if season_scheme == "monthly":
         time_cols = ["year", "month"]
     else:
-        time_cols = ["season"]
-    time_cols += ["season_year"]
+        time_cols = ["season", "season_year"]
     return base + time_cols
 
 
