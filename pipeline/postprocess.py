@@ -50,9 +50,9 @@ TRACKING_SERVER_ARN = (
 # "Concerning" = ward mean is 10–20% above the global average
 # "Critical"   = ward mean is >20% above the global average
 DEFAULT_RISK_THRESHOLDS = {
-    "Normal": (0.0, 0.10),
-    "Concerning": (0.10, 0.20),
-    "Critical": (0.20, float("inf")),
+    "Normal": (0.0, 0.05),
+    "Concerning": (0.05, 0.10),
+    "Critical": (0.10, float("inf")),
 }
 
 
