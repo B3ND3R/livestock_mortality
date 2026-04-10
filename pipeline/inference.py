@@ -128,6 +128,8 @@ def run_inference(
         # ── 6. Merge with metadata and write ─────────────────────────────────
         result_df = metadata_df.copy()
         result_df["prediction"] = ensemble_pred
+        for model_name, preds in predictions.items():
+            result_df[f"pred_{model_name}"] = preds
 
         out_prefix = output_s3_base_uri.rstrip("/")
         predictions_s3 = f"{out_prefix}/predictions_with_metadata.parquet"

@@ -644,9 +644,20 @@ def run_postprocess(
 
                 # Aggregate per ward
                 ward_results = []
+                model_pred_cols = [c for c in time_grp.columns if c.startswith("pred_")]
+
                 for pcode, group in time_grp.groupby("ADM3_PCODE"):
                     preds = group[prediction_column]
                     mean_score = float(preds.mean())
+
+                    # For ward-level data there is one prediction row per ward,
+                    # so spread across observations is undefined. Use ensemble
+                    # member disagreement instead when per-model columns exist.
+                    if model_pred_cols and len(preds) <= 1:
+                        ensemble_preds = group[model_pred_cols].iloc[0]
+                        confidence = compute_ward_confidence(ensemble_preds)
+                    else:
+                        confidence = compute_ward_confidence(preds)
 
                     ward_info = {
                         "ADM3_PCODE": pcode,
@@ -658,7 +669,7 @@ def run_postprocess(
                         "max_predicted_loss_ratio": round(float(preds.max()), 6),
                         "n_observations": int(len(preds)),
                         "risk_level": assign_risk_level(mean_score, global_mean, thresholds),
-                        "confidence": compute_ward_confidence(preds),
+                        "confidence": confidence,
                     }
 
                     # Top SHAP features for this ward/timepoint

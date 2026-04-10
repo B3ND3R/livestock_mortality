@@ -154,6 +154,10 @@ is taken across all four model predictions. Models with weight 0 are skipped.
 Ridge receives Ridge-scaled features (`feature_scaler.joblib`); XGBoost, LightGBM
 and RF receive raw median-imputed features.
 
+`ModelInference` writes per-model predictions alongside the ensemble average
+(`pred_xgboost`, `pred_lgbm`, `pred_rf`, `pred_ridge`) so that the postprocessor
+can use ensemble member disagreement as the confidence signal (see below).
+
 #### Outputs — per-timepoint subdirectories
 
 `InferencePostprocess` splits predictions by timepoint and writes a separate set
@@ -181,14 +185,21 @@ for biannual/quadseasonal they are `<season_year><season>` (e.g. `2019OND`).
 | 2 | `confidence` | float32 0–1 | −9999 |
 | 3 | `top_feature_importance` | float32 — mean \|SHAP\| of #1 feature per ward | −9999 |
 
+**Confidence score** is computed as `1 - (std / 0.5)`, clamped to [0, 1]:
+
+- **Ward-level granularity** (this pipeline): confidence reflects *ensemble disagreement* — the spread of the four model predictions (`pred_xgboost`, `pred_lgbm`, `pred_rf`, `pred_ridge`) for that ward. Low spread → high confidence.
+- **Household-level granularity**: confidence reflects *spatial consistency* — the spread of household-level predictions within the ward polygon. Low spread → high confidence.
+
+The cap of 0.5 is a conservative upper bound for the std of a [0, 1]-bounded variable.
+
 **Risk levels** are assigned relative to the training label mean (anchored via
 `run_metadata.json`) so thresholds are consistent across time windows:
 
 | Level | Condition |
 |-------|-----------|
-| Normal | ward mean ≤ 10% above training mean |
-| Concerning | 10–20% above training mean |
-| Critical | > 20% above training mean |
+| Normal | ward mean ≤ 5% above training mean |
+| Concerning | 5-10% above training mean |
+| Critical | > 10% above training mean |
 
 #### Running all three schemes
 
