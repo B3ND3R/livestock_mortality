@@ -210,6 +210,56 @@ def _timepoint_label(time_key, season_scheme: str) -> str:
     return f"{int(season_year)}{season}"
 
 
+def _write_ward_geojson(ward_geo: "gpd.GeoDataFrame", output_path: str) -> None:
+    """
+    Write ward predictions as GeoJSON matching the desired schema:
+    - FeatureCollection with top-level "name": "ward_predictions"
+    - Per-feature properties: ADM3_EN, pcode (renamed from ADM3_PCODE),
+      prediction stats, confidence, risk_level, n_observations, top_features
+    - top_features serialized as a JSON array (not a string)
+    - ADM2_EN and ADM1_EN excluded
+    """
+    raw = json.loads(ward_geo.to_json())
+
+    features = []
+    for feat in raw["features"]:
+        props = feat["properties"]
+
+        top_features = props.get("top_features", "[]")
+        if isinstance(top_features, str):
+            try:
+                top_features = json.loads(top_features)
+            except Exception:
+                top_features = []
+
+        new_props = {
+            "ADM3_EN":                    props.get("ADM3_EN"),
+            "pcode":                      props.get("ADM3_PCODE"),
+            "mean_predicted_loss_ratio":  props.get("mean_predicted_loss_ratio"),
+            "median_predicted_loss_ratio": props.get("median_predicted_loss_ratio"),
+            "max_predicted_loss_ratio":   props.get("max_predicted_loss_ratio"),
+            "confidence":                 props.get("confidence"),
+            "risk_level":                 props.get("risk_level"),
+            "n_observations":             props.get("n_observations"),
+            "top_features":               top_features,
+        }
+
+        features.append({
+            "type":       "Feature",
+            "properties": new_props,
+            "geometry":   feat["geometry"],
+        })
+
+    geojson = {
+        "type":     "FeatureCollection",
+        "name":     "ward_predictions",
+        "features": features,
+    }
+
+    with open(output_path, "w") as f:
+        json.dump(geojson, f)
+
+
 def rasterize_ward_predictions(
     ward_geo: "gpd.GeoDataFrame",
     output_path: str,
@@ -649,7 +699,7 @@ def run_postprocess(
                     geotiff_path = os.path.join(tmp_dir, "ward_predictions.tif")
 
                     ward_df.to_csv(csv_path, index=False)
-                    ward_geo.to_file(geojson_path, driver="GeoJSON")
+                    _write_ward_geojson(ward_geo, geojson_path)
                     rasterize_ward_predictions(ward_geo, output_path=geotiff_path, resolution=geotiff_resolution)
 
                     mlflow.log_artifacts(tmp_dir, artifact_path=f"postprocessing/{tp_label}")
