@@ -11,7 +11,7 @@ S3_BUCKET = "amazon-sagemaker-575108933641-us-east-1-c422b90ce861"
 # rf_model.joblib, ridge_model.joblib, feature_scaler.joblib,
 # feature_names.json, train_medians.json, ensemble_weights.json, run_metadata.json
 MODEL_BASE_PREFIX = (
-    "dzd-ayr06tncl712p3/5t7l23o0xvt99j/shared/lmr_example_models"
+    "dzd-ayr06tncl712p3/5t7l23o0xvt99j/shared/final_lmr_ward_results/inference_bundle"
 )
 
 # S3 key for the Kenya ADMIN3 ward boundary GeoJSON
