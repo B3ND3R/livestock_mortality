@@ -86,7 +86,10 @@ def run_preprocess(
     fold_paths : list[dict]
         Each dict has keys: fold_index, train, val, train_rows, val_rows, val_years.
     test_s3_path : str
-        S3 path to held-out final test set CSV.
+        S3 path to held-out final test set CSV (features + label only).
+    test_metadata_s3_path : str or None
+        S3 path to test set with GPS metadata columns, for postprocessing.
+        None if GPS columns are not present in the raw data.
     experiment_name : str
     run_id : str
         Parent MLflow run id.
@@ -129,19 +132,24 @@ def run_preprocess(
 
             # ---- Load ----
             try:
-                df = pd.read_parquet(raw_data_s3_path)
+                df_full = pd.read_parquet(raw_data_s3_path)
             except Exception as e:
                 raise ValueError(f"Could not read parquet file: {raw_data_s3_path}") from e
 
             required_cols = [date_column, label_column] + list(feature_names)
-            missing_cols = [c for c in required_cols if c not in df.columns]
+            missing_cols = [c for c in required_cols if c not in df_full.columns]
             if missing_cols:
                 raise ValueError(
                     f"Columns missing from data: {missing_cols}. "
-                    f"Available: {df.columns.tolist()}"
+                    f"Available: {df_full.columns.tolist()}"
                 )
 
-            df = df[[date_column, label_column] + list(feature_names)].copy()
+            # Preserve GPS metadata columns for postprocessing (spatial join)
+            metadata_cols = ["gps_latitude", "gps_longitude"]
+            available_metadata = [c for c in metadata_cols if c in df_full.columns]
+
+            keep_cols = [date_column, label_column] + list(feature_names) + available_metadata
+            df = df_full[list(dict.fromkeys(keep_cols))].copy()  # dedupe, preserve order
 
             initial_shape = df.shape
             missing_before = int(df.isnull().sum().sum())
@@ -288,6 +296,18 @@ def run_preprocess(
             )
             print(f"Test set: years={test_years} rows={len(test_df)} → {test_s3_path}")
 
+            # Write a second test CSV with GPS metadata for postprocessing
+            test_metadata_s3_path = None
+            if available_metadata:
+                metadata_save_cols = cols_to_save + available_metadata
+                test_metadata_s3_path = _write_csv(
+                    test_df[metadata_save_cols],
+                    s3_base_uri=output_s3_base_uri,
+                    prefix=output_prefix,
+                    name="test_with_metadata",
+                )
+                print(f"Test+metadata: {test_metadata_s3_path}")
+
             # ---- Persist scaler + medians as MLflow artifacts ----
             with tempfile.TemporaryDirectory() as tmp_dir:
                 scaler_path = os.path.join(tmp_dir, "feature_scaler.joblib")
@@ -309,7 +329,7 @@ def run_preprocess(
                 "test_rows": int(len(test_df)),
             })
 
-    return fold_paths, test_s3_path, experiment_name, run_id
+    return fold_paths, test_s3_path, test_metadata_s3_path, experiment_name, run_id
 
 
 def _impute_and_scale(
