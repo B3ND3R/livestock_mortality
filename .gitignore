@@ -16,10 +16,12 @@ data/*
 # notebook checkpoints
 .ipynb_checkpoints/*
 */.ipynb_checkpoints/*
+pipeline/.ipynb_checkpoints/*
 
 # pycache
 __pycache__/*
 */__pycache__/*
+pipeline/__pycache__/*
 
 # scratch files in development
 TODO

@@ -118,7 +118,7 @@ with tempfile.TemporaryDirectory() as tmp_dir:
     pred_df.to_parquet(predictions_s3, index=False)
     print(f"SHAP top features computed for {len(ward_top)} wards")
 
-    csv_s3, geojson_s3, geotiff_s3 = run_postprocess(
+    base_dir, output_dirs = run_postprocess(
         predictions_s3_path=predictions_s3,
         experiment_name="lmr-ward-inference-test",
         run_id=None,
@@ -131,12 +131,12 @@ with tempfile.TemporaryDirectory() as tmp_dir:
         granularity="ward",
         compute_shap=False,
         training_label_mean=label_mean,
+        season_scheme=SEASON,
     )
 
-print(f"\nStep 3 outputs:")
-print(f"  CSV:     {csv_s3}")
-print(f"  GeoJSON: {geojson_s3}")
-print(f"  GeoTIFF: {geotiff_s3}")
+print(f"\nStep 3 outputs (base): {base_dir}")
+for d in output_dirs:
+    print(f"  {d}/ward_predictions.{{csv,geojson,tif}}")
 
 print("\n" + "=" * 60)
 print("ALL STEPS COMPLETED SUCCESSFULLY")
